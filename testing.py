@@ -1,0 +1,2 @@
+import clifford
+clifford.time()
