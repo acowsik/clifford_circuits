@@ -434,7 +434,63 @@ cdef class DensityMatrix:
                     break
         
         return current_row - region_size # this will tell us how many rows there are below which there are all zeros
+
+    def random_unitary(self, i_min: int, i_max: int) -> List[int]:
+        """
+        Applies a random unitary and then rturns a list with the information to apply it again.
+        """
+        assert i_min < i_max <= len(self)
+        length = i_max - i_min
+
+        choices = []
+
+        for step in range(length):
+            for loc in range(i_min, i_max):
+                choices.append(random.randrange(4))
+                (self.x_2, self.y_2, self.z_2, self.identity)[choices[-1]](loc)
+            
+            for loc in range(i_min + step % 2, i_max, 2):
+                if loc + 1 < i_max:
+                    choices.append(random.randrange(3))
+                    [self.swap, self.iswap, self.cnot][choices[-1]](loc, loc + 1)
         
+        return choices
+
+    def unitary(self, i_min: int, i_max: int, choices: List[int]) -> None:
+        """
+        Executes the unitary given by the list of choices
+        """
+        assert i_min < i_max <= len(self)
+        length = i_max - i_min
+
+        choices = iter(choices)
+
+        for step in range(length):
+            for loc in range(i_min, i_max):
+                (self.x_2, self.y_2, self.z_2, self.identity)[next(choices)](loc)
+
+            for loc in range(i_min + step % 2, i_max, 2):
+                if loc + 1 < i_max:
+                    [self.swap, self.iswap, self.cnot][next(choices)](loc, loc + 1)
+
+    def inverse_unitary(self, i_min: int, i_max: int, choices: List[int]) -> None:
+        """
+        Executes the inverse unitary given by the list of choices
+        """
+        assert i_min < i_max <= len(self)
+        length = i_max - i_min
+
+        reversed_choices = reversed(choices)
+
+        for step in reversed(range(length)):
+            for loc in reversed(range(i_min + step % 2, i_max, 2)):
+                if loc + 1 < i_max:
+                    # notice that the inverse of iswap is not iswap, but it is true up to a
+                    # sign which we do not keep track of here
+                    [self.swap, self.iswap, self.cnot][next(reversed_choices)](loc, loc + 1)
+            
+            for loc in reversed(range(i_min, i_max)):
+                (self.x_2, self.y_2, self.z_2, self.identity)[next(reversed_choices)](loc)
     
     def __str__(self):
         return '\n'.join(['-' * (len(self.stabilizers[0]) * 4)] + [str(ps) for ps in self.stabilizers] + ['*' * (len(self.stabilizers[0]) * 4)])
@@ -604,6 +660,16 @@ def test():
     rho.clip_gauge()
     print(rho)
 
+    rho = DensityMatrix([x(i, L) for i in range(L)])
+    choices = rho.random_unitary(0, L)
+    rho2 = DensityMatrix([x(i, L) for i in range(L)])
+    rho2.unitary(0, L, choices)
+    assert str(rho) == str(rho2)
+    rho2.inverse_unitary(0, L, choices)
+
+    rho2.clip_gauge()
+    rho3 = DensityMatrix([x(i, L) for i in range(L)])
+    assert str(rho2) == str(rho3)
 
     L = 20
     rho = ChunkedState([x(i, L) for i in range(L)])
