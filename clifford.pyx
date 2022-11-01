@@ -1,3 +1,4 @@
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 import random
 import matplotlib.pyplot as plt
 import pickle
@@ -6,13 +7,13 @@ import numpy as np
 cimport numpy as np
 import progressbar
 import numba
-
+from clifford_circuits.permutation import Permutation, split_regions_by_permutation
 
 cdef long pack_bits((char, char, char, char) bits):
     return (( (<long>bits[0]) << 1 | (<long>bits[1])) << 1 | (<long>bits[2])) << 1 | (<long>bits[3])
 
-cdef (char, char, char, char) unpack_bits(long bits):
-    return <char> ((bits & 0b1000) != 0), <char> ((bits & 0b100) != 0), <char> ((bits & 0b10) != 0), <char> ((bits & 1) != 0)
+# cdef (char, char, char, char) unpack_bits(long bits):
+#     return <char> ((bits & 0b1000) != 0), <char> ((bits & 0b100) != 0), <char> ((bits & 0b10) != 0), <char> ((bits & 1) != 0)
 
 cdef list cnot_mapping = [(False, False, False, False), (False, True, False, True), 
                           (False, False, True, False), (False, True, True, True), 
@@ -42,8 +43,6 @@ cdef list iswap_mapping = [(False, False, False, False), (False, True, False, Fa
                            (True, False, True, True), (True, True, True, True)]
 
 cdef class PauliString:
-    
-
     cdef public char [:] z_string
     cdef public char [:] x_string
 
@@ -191,7 +190,7 @@ cdef class PauliString:
         builder = []
         for i, (x, z) in enumerate(zip(self.x_string, self.z_string)):
             if not x and not z:
-                builder.append(f'   ')
+                builder.append(' ' * len(f"Z_{i}"))
             elif not x and z:
                 builder.append(f"Z_{i}")
             elif x and not z:
@@ -215,12 +214,53 @@ cdef class PauliString:
         
         raise ValueError("This is the identity pauli string")
     
+    cpdef PauliString subsystem(self, long i, long j, copy_to: PauliString):
+        assert i < j
+        assert self.right() < j
+        assert self.left() >= i
+        assert j - i == len(copy_to)
+
+        cdef long k
+        for k in range(i, j):
+            copy_to.x_string[k - i] = self.x_string[k]
+            copy_to.z_string[k - i] = self.z_string[k]
+
+        return copy_to
+
     cdef long stabilizer_length(self):
         return self.right() - self.left() + 1
 
     def __reduce__(self):
         return (PauliString, (np.array(self.x_string), np.array(self.z_string)), None, None, None)
 
+
+    cpdef permute(self, permutation: Permutation):
+        """
+        Permutes this pauli string in-place.
+        """
+
+        cdef list perm = permutation.permutation
+
+        cdef char x_val, z_val
+        cdef int[:] done = np.zeros(len(self), dtype=np.int32)
+        
+        cdef int i = 0
+        cdef int j = 0
+
+        for i in range(len(self)):
+            if not done[i]:
+                x_val = self.x_string[i]
+                z_val = self.z_string[i]
+                j = i
+                while not done[j]:
+                    done[j] = True
+                    j = perm[j]
+                    x_val, self.x_string[j] = self.x_string[j], x_val
+                    z_val, self.z_string[j] = self.z_string[j], z_val
+
+                    
+        
+        
 
 def x(n: int, length: int) -> PauliString:
     x_str = np.zeros(length, dtype=bool)
@@ -249,6 +289,7 @@ cdef class DensityMatrix:
     def __init__(self, stabilizers: List[PauliString]) -> None:
         self.stabilizers = [i.copy() for i in stabilizers]
         self.system_size = len(self.stabilizers[0])
+        assert self.system_size == len(self.stabilizers)
     
     cpdef void measure(self, operator: PauliString):
         anticommuting_indices = [i for i, stabilizer in enumerate(self.stabilizers) if stabilizer.anticommutes(operator)]
@@ -306,6 +347,10 @@ cdef class DensityMatrix:
         for stabilizer in self.stabilizers:
             stabilizer.single_qbit(location, x_to, z_to)
     
+    cpdef void permute(self, perm: Permutation):
+        for string in self.stabilizers:
+            string.permute(perm)
+    
     def random_single_qbit(self, location: int):
         possibilities = (False, True), (True, False), (True, True)
         self.single_qbit(location, *random.sample(possibilities, 2))
@@ -313,6 +358,28 @@ cdef class DensityMatrix:
 
     def copy(self) -> "DensityMatrix":
         return self.__class__(self.stabilizers)
+    
+    def clone_from(self, other: "DensityMatrix") -> None:
+        assert len(self) == len(other)
+        for my_stabilizer, other_stabilizer in zip(self.stabilizers, other.stabilizers):
+            my_stabilizer.clone_from(other_stabilizer)
+    
+    def get_substate(self, region_start: int, region_end: int, copy_to: "DensityMatrix") -> "DensityMatrix":
+        self.clip_gauge()
+
+        for stabilizer in self.stabilizers[:region_start]:
+            assert stabilizer.right() < region_start
+        
+        for stabilizer in self.stabilizers[region_end:]:
+            if stabilizer.left() < region_end:
+                print(stabilizer)
+            assert stabilizer.left() >= region_end
+        
+        assert len(copy_to) == region_end - region_start
+
+        for stabilizer, copy_to_stabilizer in zip(self.stabilizers[region_start:region_end], copy_to.stabilizers):
+            stabilizer.subsystem(region_start, region_end, copy_to_stabilizer)
+
 
     def clip_gauge(self) -> None:
         # this algorithm is specialized for this case 
@@ -385,6 +452,30 @@ cdef class DensityMatrix:
             assert i % 2 == 0
 
         return [i // 2 for i in entropies]
+    
+    def entropies_of_permutably_contiguous_regions(self, regions: List[List[int]], perms: List[Permutation], division: List[List[Tuple[int, List[int], Tuple[int, int]]]], workhorse_state: "DensityMatrix") -> List[int]:
+        # division = split_regions_by_permutation(regions, perms)
+        output = [None] * len(regions)
+        assert len(self) == len(workhorse_state)
+        
+        for subset, perm in zip(division, perms):
+            assert len(workhorse_state) == perm.size
+            workhorse_state.clone_from(self)
+            workhorse_state.permute(perm)
+
+            region_subset = [endpoints for (region_index, region, endpoints) in subset]
+            indices = [region_index for (region_index, region, endpoints) in subset]
+
+            
+
+            entropies = workhorse_state.entropies_of_contiguous_regions(region_subset)
+
+            for idx, H in zip(indices, entropies):
+                output[idx] = H
+        
+        return output
+
+                
 
     def contiguous_entropy(self, left: int, right: int) -> int:
         self.clip_gauge()
@@ -435,12 +526,11 @@ cdef class DensityMatrix:
         
         return current_row - region_size # this will tell us how many rows there are below which there are all zeros
 
-    def random_unitary(self, i_min: int, i_max: int) -> List[int]:
+    def random_unitary(self, i_min: int, i_max: int, length: int) -> List[int]:
         """
         Applies a random unitary and then rturns a list with the information to apply it again.
         """
         assert i_min < i_max <= len(self)
-        length = i_max - i_min
 
         choices = []
 
@@ -456,12 +546,11 @@ cdef class DensityMatrix:
         
         return choices
 
-    def unitary(self, i_min: int, i_max: int, choices: List[int]) -> None:
+    def unitary(self, i_min: int, i_max: int, length: int, choices: List[int]) -> None:
         """
         Executes the unitary given by the list of choices
         """
         assert i_min < i_max <= len(self)
-        length = i_max - i_min
 
         choices = iter(choices)
 
@@ -473,12 +562,11 @@ cdef class DensityMatrix:
                 if loc + 1 < i_max:
                     [self.swap, self.iswap, self.cnot][next(choices)](loc, loc + 1)
 
-    def inverse_unitary(self, i_min: int, i_max: int, choices: List[int]) -> None:
+    def inverse_unitary(self, i_min: int, i_max: int, length: int, choices: List[int]) -> None:
         """
         Executes the inverse unitary given by the list of choices
         """
         assert i_min < i_max <= len(self)
-        length = i_max - i_min
 
         reversed_choices = reversed(choices)
 
@@ -661,15 +749,44 @@ def test():
     print(rho)
 
     rho = DensityMatrix([x(i, L) for i in range(L)])
-    choices = rho.random_unitary(0, L)
+    choices = rho.random_unitary(0, L, L)
     rho2 = DensityMatrix([x(i, L) for i in range(L)])
-    rho2.unitary(0, L, choices)
+    rho2.unitary(0, L, L, choices)
     assert str(rho) == str(rho2)
-    rho2.inverse_unitary(0, L, choices)
+    rho2.inverse_unitary(0, L, L, choices)
 
     rho2.clip_gauge()
     rho3 = DensityMatrix([x(i, L) for i in range(L)])
     assert str(rho2) == str(rho3)
+
+    L=20
+    region_start = 5
+    region_end = 15
+    rho = ChunkedState([z(i, L) for i in range(L)])
+    rho.chunked_random_unitary(0, L)
+    #now measure out the ends
+
+    outrho = DensityMatrix([z(i, region_end - region_start) for i in range(region_end - region_start)])
+    
+    try:
+        rho.get_substate(region_start, region_end, outrho)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Test Failed to detect something wrong with the subregion")
+
+    for i in range(region_start):
+        rho.measure(z(i, L))
+    for i in range(region_end, L):
+        rho.measure(z(i, L))
+    
+    rho.get_substate(region_start, region_end, outrho)
+
+    print(rho)
+    print(outrho)
+
+    print("Passed new test!")
+
 
     L = 20
     rho = ChunkedState([x(i, L) for i in range(L)])
@@ -686,6 +803,8 @@ def test():
     assert rho.contiguous_entropy(1, 2) == rho.entropy(list(range(1,2)))
     assert rho.contiguous_entropy(0, 3) == rho.entropy(list(range(3)))
 
+    assert rho.entropies_of_contiguous_regions([(0, 1), (0, 2), (1, 2), (0, 3)]) == [rho.contiguous_entropy(0, 1), rho.contiguous_entropy(0, 2), rho.contiguous_entropy(1, 2), rho.contiguous_entropy(0, 3)]
+
     pauli = x(0, 1)
     pauli.single_qbit(0, (True, False), (False, True))
     assert pauli == x(0, 1)
@@ -695,8 +814,6 @@ def test():
     assert pauli == x(0, 1)
     pauli.single_qbit(0, (False, True), (True, False))
     assert pauli == z(0, 1)
-
-    
 
     print("All tests passed")
 
